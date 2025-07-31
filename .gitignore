@@ -1,0 +1,19 @@
+# Application specific files
+photos/
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# System files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
