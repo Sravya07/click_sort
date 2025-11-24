@@ -8,6 +8,13 @@ from PIL import Image, ExifTags
 import imagehash
 from sqlalchemy.orm import Session
 
+# Register HEIC/HEIF support with Pillow
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    print("Warning: pillow-heif not installed. HEIC files will not be supported.")
+
 from app.database import MediaFile, ScanSession, get_db, SessionLocal
 
 SUPPORTED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp', '.heic', '.heif'}
@@ -72,7 +79,12 @@ def get_exif_date(file_path: str) -> Optional[datetime]:
     """Extract date taken from EXIF metadata."""
     try:
         img = Image.open(file_path)
-        exif_data = img._getexif()
+
+        # Try standard EXIF extraction first (works for JPEG, etc.)
+        exif_data = None
+        if hasattr(img, '_getexif') and img._getexif is not None:
+            exif_data = img._getexif()
+
         if exif_data:
             for tag, value in exif_data.items():
                 decoded = ExifTags.TAGS.get(tag, tag)
@@ -80,6 +92,35 @@ def get_exif_date(file_path: str) -> Optional[datetime]:
                     return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
                 elif decoded == "DateTime":
                     return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+
+        # Try getexif() method (works for HEIC via pillow-heif)
+        if hasattr(img, 'getexif'):
+            exif = img.getexif()
+            if exif:
+                # DateTimeOriginal is tag 36867, DateTime is tag 306
+                for tag_id in [36867, 306]:
+                    if tag_id in exif:
+                        value = exif[tag_id]
+                        if isinstance(value, str):
+                            return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+
+        # Try to get HEIC metadata directly
+        if hasattr(img, 'info') and 'exif' in img.info:
+            from PIL.ExifTags import TAGS
+            exif_bytes = img.info['exif']
+            if exif_bytes:
+                try:
+                    from PIL import Image as PILImage
+                    exif = PILImage.Exif()
+                    exif.load(exif_bytes)
+                    for tag_id in [36867, 306]:
+                        if tag_id in exif:
+                            value = exif[tag_id]
+                            if isinstance(value, str):
+                                return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                except Exception:
+                    pass
+
     except Exception as e:
         print(f"EXIF read error for {file_path}: {e}")
     return None
@@ -340,5 +381,84 @@ def get_scan_status(session_id: int) -> Optional[dict]:
             'started_at': session.started_at,
             'completed_at': session.completed_at
         }
+    finally:
+        db.close()
+
+
+def mark_interrupted_sessions():
+    """
+    Mark any in_progress sessions as interrupted on server startup.
+    This handles cases where the server was stopped/killed during a scan.
+    """
+    db = SessionLocal()
+    try:
+        interrupted_sessions = db.query(ScanSession).filter(
+            ScanSession.status == "in_progress"
+        ).all()
+
+        for session in interrupted_sessions:
+            session.status = "interrupted"
+            session.error_message = "Scan was interrupted (server stopped). Resume by starting a new scan for the same folder."
+
+        db.commit()
+
+        if interrupted_sessions:
+            print(f"Marked {len(interrupted_sessions)} interrupted scan session(s)")
+
+        return len(interrupted_sessions)
+    finally:
+        db.close()
+
+
+def cancel_scan(session_id: int) -> Optional[dict]:
+    """Cancel an in-progress or interrupted scan session."""
+    db = SessionLocal()
+    try:
+        session = db.query(ScanSession).filter(ScanSession.id == session_id).first()
+        if not session:
+            return None
+
+        if session.status in ("completed", "cancelled"):
+            return {
+                'success': False,
+                'message': f"Scan is already {session.status}",
+                'session_id': session_id
+            }
+
+        session.status = "cancelled"
+        session.error_message = "Scan was cancelled by user"
+        session.completed_at = datetime.utcnow()
+        db.commit()
+
+        return {
+            'success': True,
+            'message': "Scan cancelled successfully",
+            'session_id': session_id
+        }
+    finally:
+        db.close()
+
+
+def get_all_scan_sessions() -> List[dict]:
+    """Get all scan sessions with their statuses."""
+    db = SessionLocal()
+    try:
+        sessions = db.query(ScanSession).order_by(ScanSession.id.desc()).all()
+
+        result = []
+        for session in sessions:
+            progress = (session.processed_files / session.total_files * 100) if session.total_files > 0 else 0
+            result.append({
+                'session_id': session.id,
+                'folder_path': session.folder_path,
+                'status': session.status,
+                'total_files': session.total_files,
+                'processed_files': session.processed_files,
+                'progress_percent': round(progress, 2),
+                'started_at': session.started_at,
+                'completed_at': session.completed_at
+            })
+
+        return result
     finally:
         db.close()

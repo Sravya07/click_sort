@@ -21,6 +21,7 @@ class ScanStatus(str, Enum):
 class ScanRequest(BaseModel):
     folder_path: str = Field(..., description="Path to the folder containing photos")
     include_subfolders: bool = Field(default=True, description="Whether to scan subfolders")
+    force_restart: bool = Field(default=False, description="Force restart scan from beginning (ignore previous progress)")
 
 
 class DateQueryRequest(BaseModel):

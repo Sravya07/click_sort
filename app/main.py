@@ -11,6 +11,9 @@ from app.routers import media, duplicates, organize, scan
 async def lifespan(app: FastAPI):
     """Initialize database on startup."""
     init_db()
+    # Mark any in-progress scans as interrupted (server was stopped)
+    from app.services.scanner import mark_interrupted_sessions
+    mark_interrupted_sessions()
     yield
 
 

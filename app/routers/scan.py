@@ -55,20 +55,32 @@ async def start_scan(
             detail=f"Folder not found: {folder_path}"
         )
 
-    # Check for existing in-progress scan
+    # Check for existing in-progress or interrupted scan
     existing = db.query(ScanSession).filter(
         ScanSession.folder_path == folder_path,
-        ScanSession.status == "in_progress"
+        ScanSession.status.in_(["in_progress", "interrupted"])
     ).first()
 
     if existing:
-        return {
-            'message': 'Resuming existing scan session',
-            'session_id': existing.id,
-            'status': 'in_progress',
-            'processed_files': existing.processed_files,
-            'total_files': existing.total_files
-        }
+        if request.force_restart:
+            # Cancel existing session and start fresh
+            existing.status = "cancelled"
+            existing.error_message = "Cancelled to start a fresh scan"
+            db.commit()
+        else:
+            if existing.status == "interrupted":
+                # Resume interrupted scan
+                existing.status = "in_progress"
+                existing.error_message = None
+                db.commit()
+
+            return {
+                'message': 'Resuming existing scan session',
+                'session_id': existing.id,
+                'status': 'in_progress',
+                'processed_files': existing.processed_files,
+                'total_files': existing.total_files
+            }
 
     # Count files for progress tracking
     total_files = count_files(folder_path, request.include_subfolders)
@@ -171,7 +183,7 @@ async def cancel_scan(
     session_id: int,
     db: Session = Depends(get_db)
 ):
-    """Cancel an in-progress scan session."""
+    """Cancel an in-progress or interrupted scan session."""
     session = db.query(ScanSession).filter(ScanSession.id == session_id).first()
 
     if not session:
@@ -180,13 +192,14 @@ async def cancel_scan(
             detail=f"Scan session {session_id} not found"
         )
 
-    if session.status != "in_progress":
+    if session.status not in ("in_progress", "interrupted"):
         return {
             'message': f'Session is already {session.status}',
             'session_id': session_id
         }
 
     session.status = "cancelled"
+    session.error_message = "Scan was cancelled by user"
     db.commit()
 
     return {
