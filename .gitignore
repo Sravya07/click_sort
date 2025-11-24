@@ -1,11 +1,29 @@
 # Application specific files
 photos/
 
+# Database files
+data/*.db
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+.env
+
 # pyenv
 .python-version
 
 # pipenv
 Pipfile.lock
+
+# pytest
+.pytest_cache/
 
 # VS Code
 .vscode/
@@ -17,3 +35,8 @@ Pipfile.lock
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+
+# IDE
+.idea/
+*.swp
+*.swo
