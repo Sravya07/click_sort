@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 
-from app.database import get_db, ScanSession
+from app.database import get_db, ScanSession, MediaFile
 from app.models import ScanRequest, ScanStatusResponse
 from app.services.scanner import scan_folder, get_scan_status, count_files
 
@@ -66,7 +66,14 @@ async def start_scan(
             # Cancel existing session and start fresh
             existing.status = "cancelled"
             existing.error_message = "Cancelled to start a fresh scan"
+
+            # Delete all media files from this folder to force rescan
+            deleted_count = db.query(MediaFile).filter(
+                MediaFile.folder_path.startswith(folder_path)
+            ).delete(synchronize_session=False)
+
             db.commit()
+            print(f"Force restart: cancelled session {existing.id}, deleted {deleted_count} media records")
         else:
             if existing.status == "interrupted":
                 # Resume interrupted scan
@@ -81,6 +88,15 @@ async def start_scan(
                 'processed_files': existing.processed_files,
                 'total_files': existing.total_files
             }
+    elif request.force_restart:
+        # No in-progress session, but force_restart requested
+        # Delete all media files from this folder to force full rescan
+        deleted_count = db.query(MediaFile).filter(
+            MediaFile.folder_path.startswith(folder_path)
+        ).delete(synchronize_session=False)
+        db.commit()
+        if deleted_count > 0:
+            print(f"Force restart: deleted {deleted_count} media records for fresh scan")
 
     # Count files for progress tracking
     total_files = count_files(folder_path, request.include_subfolders)

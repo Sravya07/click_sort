@@ -16,6 +16,7 @@ except ImportError:
     print("Warning: pillow-heif not installed. HEIC files will not be supported.")
 
 from app.database import MediaFile, ScanSession, get_db, SessionLocal
+from app.services.logger import get_session_logger, app_logger
 
 SUPPORTED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp', '.heic', '.heif'}
 
@@ -75,6 +76,68 @@ def get_perceptual_hashes(file_path: str) -> Tuple[Optional[str], Optional[str],
         return None, None, None
 
 
+def parse_exif_datetime(value: str) -> Optional[datetime]:
+    """Parse EXIF datetime string in various formats."""
+    if not isinstance(value, str):
+        return None
+
+    # Common EXIF date formats
+    formats = [
+        "%Y:%m:%d %H:%M:%S",           # Standard EXIF: 2023:06:15 14:30:00
+        "%Y-%m-%dT%H:%M:%S",           # ISO 8601: 2023-06-15T14:30:00
+        "%Y-%m-%dT%H:%M:%S%z",         # ISO 8601 with timezone: 2023-06-15T14:30:00+05:00
+        "%Y-%m-%d %H:%M:%S",           # Simple: 2023-06-15 14:30:00
+        "%Y/%m/%d %H:%M:%S",           # Slash format: 2023/06/15 14:30:00
+    ]
+
+    # Handle timezone offset format (remove colon in timezone for %z)
+    # e.g., 2016-01-14T17:27:10-05:00 -> 2016-01-14T17:27:10-0500
+    if 'T' in value and ('+' in value or value.count('-') > 2):
+        # Try to fix timezone format
+        try:
+            # Remove the colon in timezone offset
+            if value[-3] == ':':
+                value_fixed = value[:-3] + value[-2:]
+                try:
+                    return datetime.strptime(value_fixed, "%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
+                except ValueError:
+                    pass
+            # Try without timezone
+            value_no_tz = value.split('+')[0].split('-05')[0].split('-04')[0]
+            if 'T' in value_no_tz:
+                value_no_tz = value_no_tz.rsplit('-', 1)[0] if value_no_tz.count('-') > 2 else value_no_tz
+        except Exception:
+            pass
+
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(value, fmt)
+            # Remove timezone info if present
+            return dt.replace(tzinfo=None) if hasattr(dt, 'tzinfo') and dt.tzinfo else dt
+        except ValueError:
+            continue
+
+    # Last resort: try to extract just the date part
+    try:
+        # Handle formats like "2016-01-14T17:27:10-05:00"
+        if 'T' in value:
+            date_part = value.split('T')[0]
+            time_part = value.split('T')[1]
+            # Remove timezone
+            if '+' in time_part:
+                time_part = time_part.split('+')[0]
+            elif time_part.count(':') > 1 and '-' in time_part:
+                # Has timezone like -05:00
+                time_part = ':'.join(time_part.split(':')[:2]) + ':' + time_part.split(':')[2][:2]
+
+            combined = f"{date_part} {time_part}"
+            return datetime.strptime(combined, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    return None
+
+
 def get_exif_date(file_path: str) -> Optional[datetime]:
     """Extract date taken from EXIF metadata."""
     try:
@@ -89,9 +152,13 @@ def get_exif_date(file_path: str) -> Optional[datetime]:
             for tag, value in exif_data.items():
                 decoded = ExifTags.TAGS.get(tag, tag)
                 if decoded == "DateTimeOriginal":
-                    return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                    dt = parse_exif_datetime(value)
+                    if dt:
+                        return dt
                 elif decoded == "DateTime":
-                    return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                    dt = parse_exif_datetime(value)
+                    if dt:
+                        return dt
 
         # Try getexif() method (works for HEIC via pillow-heif)
         if hasattr(img, 'getexif'):
@@ -101,8 +168,9 @@ def get_exif_date(file_path: str) -> Optional[datetime]:
                 for tag_id in [36867, 306]:
                     if tag_id in exif:
                         value = exif[tag_id]
-                        if isinstance(value, str):
-                            return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                        dt = parse_exif_datetime(value)
+                        if dt:
+                            return dt
 
         # Try to get HEIC metadata directly
         if hasattr(img, 'info') and 'exif' in img.info:
@@ -116,8 +184,9 @@ def get_exif_date(file_path: str) -> Optional[datetime]:
                     for tag_id in [36867, 306]:
                         if tag_id in exif:
                             value = exif[tag_id]
-                            if isinstance(value, str):
-                                return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                            dt = parse_exif_datetime(value)
+                            if dt:
+                                return dt
                 except Exception:
                     pass
 
@@ -266,6 +335,7 @@ def scan_folder(folder_path: str, include_subfolders: bool = True,
     Returns scan statistics.
     """
     db = SessionLocal()
+    logger = None
     try:
         # Count total files
         total_files = count_files(folder_path, include_subfolders)
@@ -276,9 +346,13 @@ def scan_folder(folder_path: str, include_subfolders: bool = True,
         if existing_session:
             scan_session = existing_session
             start_after = existing_session.last_processed_file
+            logger = get_session_logger(scan_session.id)
+            logger.scan_resumed(start_after or "beginning")
         else:
             scan_session = create_scan_session(db, folder_path, total_files)
             start_after = None
+            logger = get_session_logger(scan_session.id)
+            logger.scan_started(folder_path, total_files)
 
         processed = scan_session.processed_files
         failed = scan_session.failed_files
@@ -286,7 +360,6 @@ def scan_folder(folder_path: str, include_subfolders: bool = True,
         new_files = 0
 
         skip_mode = start_after is not None
-        batch = []
 
         for file_path in discover_files(folder_path, include_subfolders):
             # Resume logic - skip files until we reach the last processed file
@@ -304,6 +377,7 @@ def scan_folder(folder_path: str, include_subfolders: bool = True,
                 if is_file_already_scanned(db, file_path, file_size, modified_time):
                     skipped += 1
                     processed += 1
+                    logger.file_skipped(file_path, "already scanned")
                     continue
 
                 # Process the file
@@ -323,21 +397,25 @@ def scan_folder(folder_path: str, include_subfolders: bool = True,
                         new_files += 1
 
                     processed += 1
+                    logger.file_processed(file_path, file_data.get('date_taken'))
                 else:
                     failed += 1
+                    logger.file_failed(file_path, "Invalid or unreadable image")
 
-                # Commit in batches
+                # Commit in batches and log progress
                 if processed % BATCH_SIZE == 0:
                     db.commit()
                     update_scan_session(db, scan_session, processed, failed, file_path)
+                    logger.scan_progress(processed, total_files, file_path)
 
             except Exception as e:
-                print(f"Error scanning {file_path}: {e}")
+                logger.file_failed(file_path, str(e))
                 failed += 1
 
         # Final commit
         db.commit()
         update_scan_session(db, scan_session, processed, failed, "", status="completed")
+        logger.scan_completed(processed, failed, new_files, skipped)
 
         return {
             'session_id': scan_session.id,
@@ -350,6 +428,8 @@ def scan_folder(folder_path: str, include_subfolders: bool = True,
         }
 
     except Exception as e:
+        if logger:
+            logger.scan_failed(str(e))
         if 'scan_session' in locals():
             update_scan_session(db, scan_session, processed, failed, "",
                               status="failed", error=str(e))

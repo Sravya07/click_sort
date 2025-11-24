@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.database import init_db
-from app.routers import media, duplicates, organize, scan
+from app.routers import media, duplicates, organize, scan, logs
 
 
 @asynccontextmanager
@@ -58,6 +58,7 @@ app.include_router(scan.router)
 app.include_router(media.router)
 app.include_router(duplicates.router)
 app.include_router(organize.router)
+app.include_router(logs.router)
 
 
 @app.get("/", tags=["Health"])
